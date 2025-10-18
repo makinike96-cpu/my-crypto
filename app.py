@@ -396,7 +396,6 @@ def generate_analysis(text):
         return f"⚖️ Новость по {coin} может вызвать краткосрочную волатильность."
     else:
         return f"🤔 {coin}: ситуация неоднозначная, наблюдаем за динамикой."
-           
             comment = generate_thought(msg)
             analysis = generate_analysis(msg)
             bot.send_message(NEWS_CHAT_ID, msg + "\n\n" + comment + "\n" + analysis)
