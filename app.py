@@ -1,492 +1,386 @@
-# v6.2 — LONG/SHORT (EMA+RSI), CoinGecko, RSS+LunarCrush news, FREE influencer monitor (web scraping), 24/7
-import os, io, time, threading, datetime as dt, math, re
-from flask import Flask, request
-import requests, xml.etree.ElementTree as ET
+# v6.5 — AutoTrader: авто-новости и сигналы, EMA/RSI по Binance, цены CoinGecko
+import os, json, time, math, random, threading, datetime
+import requests
 import telebot
-from bs4 import BeautifulSoup
+import schedule
+from xml.etree import ElementTree as ET
 
-# ========= ENV / CONFIG =========
-TOKEN    = os.getenv("TOKEN")                    # Telegram bot token (Render → Environment)
-LUNAR    = os.getenv("LUNARCRUSH_KEY")          # LunarCrush Bearer (Render → Environment, опционально)
-PORT     = int(os.environ.get("PORT", 10000))
+# ================== НАСТРОЙКИ ==================
+BOT_TOKEN      = os.getenv("BOT_TOKEN") or os.getenv("TOKEN") or "PASTE_TELEGRAM_BOT_TOKEN"
+NEWS_CHAT_ID   = int(os.getenv("NEWS_CHAT_ID") or "-1002969047835")     # Новости
+SIGNAL_CHAT_ID = int(os.getenv("SIGNAL_CHAT_ID") or "-1003166387118")   # Аналитика/сигналы
 
-TRADING_CHAT = -1003166387118   # Аналитика
-NEWS_CHAT    = -1002969047835   # Новости
-
+# лимиты в сутки
 MAX_NEWS_PER_DAY    = 7
-MAX_SIGNALS_PER_DAY = 2
-BASE_LEVERAGE_MIN   = 2
-BASE_LEVERAGE_MAX   = 7
-RISK_PER_TRADE      = 0.05       # 5% от депозита
+MAX_SIGNALS_PER_DAY = 4
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CryptoPulseBot/1.0)"}
-CG_BASE = "https://api.coingecko.com/api/v3"
-
-# RSS-ленты (легальные и бесплатные)
-RSS_FEEDS = [
-    "https://www.binance.com/en/blog/rss",
+# RSS-источники (дают pubDate → можем фильтровать по времени)
+RSS_SOURCES = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
+    "https://watcher.guru/news/feed",
+    "https://decrypt.co/feed",
+    "https://coinmarketcap.com/headlines/news/feed/",
 ]
 
-# имена/ключи влияющих персон для фильтрации
-INFLUENCER_HINTS = [
-    "elon", "musk", "трамп", "trump", "saylor", "buterin", "vitalik",
-    "cz", "zhao", "gensler", "powell", "fed", "фрс",
-    "sec", "etf", "listing", "blackrock", "fidelity", "coinbase", "binance",
-    "airdrop", "upgrade", "hack", "btc", "bitcoin", "eth", "crypto", "рынок"
+# ключевые слова для отбора «крипто»-новостей и влияющих персон
+TOP20_TICKERS = [
+    "BTC","ETH","BNB","SOL","XRP","ADA","DOGE","TRX","TON","DOT",
+    "AVAX","LINK","UNI","XLM","ICP","LTC","ATOM","NEAR","APT","ETC",
+]
+NEWS_KEYWORDS = TOP20_TICKERS + [
+    "bitcoin","ethereum","binance","coinbase","sec","etf","listing",
+    "fed","powell","rate","rally","dump","hack","airdrop","upgrade",
+    "elon","musk","trump","saylor","vitalik","cz"
 ]
 
-# бесплатные веб-источники, где часто дублируют/цитируют твиты и заявления инфлюенсеров
-INFLUENCER_SOURCES = {
-    "Илон Маск": [
-        "https://decrypt.co/tag/elon-musk",
-        "https://www.coindesk.com/tag/elon-musk/",
-        "https://watcher.guru/news/tag/elon-musk",
-    ],
-    "Дональд Трамп": [
-        "https://decrypt.co/tag/donald-trump",
-        "https://www.coindesk.com/tag/donald-trump/",
-        "https://watcher.guru/news/tag/donald-trump",
-    ],
-    "CZ (Binance)": [
-        "https://www.coindesk.com/tag/binance/",
-        "https://watcher.guru/news/tag/binance",
-    ],
-    "Майкл Сэйлор": [
-        "https://decrypt.co/tag/michael-saylor",
-        "https://www.coindesk.com/tag/microstrategy/",
-    ],
-    "Виталик Бутерин": [
-        "https://www.coindesk.com/tag/vitalik-buterin/",
-        "https://decrypt.co/tag/vitalik-buterin",
-    ],
-    "ФРС/ставки": [
-        "https://www.coindesk.com/tag/federal-reserve/",
-        "https://www.investopedia.com/markets-news-4427704",  # общая финлента, фильтруем по rate/fed
-    ],
+# хранение состояний (в файлах, чтобы не спамил при перезапусках)
+HISTORY_FILE = "sent_posts.json"   # заголовки уже отправленных новостей
+QUOTA_FILE   = "quota.json"        # счётчики за сутки
+STATE_LOCK   = threading.Lock()
+
+# CoinGecko
+CG_SIMPLE_PRICE = "https://api.coingecko.com/api/v3/simple/price"
+
+# Binance (без ключей)
+BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
+
+# соответствие CoinGecko id → тикер Binance (спот)
+SYMBOL_MAP = {
+    "bitcoin":"BTCUSDT", "ethereum":"ETHUSDT", "bnb":"BNBUSDT", "solana":"SOLUSDT",
+    "xrp":"XRPUSDT", "cardano":"ADAUSDT", "dogecoin":"DOGEUSDT", "tron":"TRXUSDT",
+    "toncoin":"TONUSDT", "avalanche":"AVAXUSDT", "polkadot":"DOTUSDT", "chainlink":"LINKUSDT",
+    "matic-network":"MATICUSDT", "litecoin":"LTCUSDT", "uniswap":"UNIUSDT", "stellar":"XLMUSDT",
+    "internet-computer":"ICPUSDT", "aptos":"APTUSDT", "ethereum-classic":"ETCUSDT", "near":"NEARUSDT"
 }
 
-VERSION = "v6.2-EMA-RSI-FREE-INF"
+# =============== ТЕЛЕГРАМ-БОТ ===============
+bot = telebot.TeleBot(BOT_TOKEN)
 
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
-state = {"date": dt.date.today(), "news": 0, "signals": 0, "top20": []}
-_seen_links = set()         # чтобы не постить одно и то же
-_seen_influencer = set()    # для дублирующихся ссылок по инфлюенсерам
-
-# ========= HELPERS =========
-def reset_counters_if_new_day():
-    today = dt.date.today()
-    if state["date"] != today:
-        state["date"] = today
-        state["news"] = 0
-        state["signals"] = 0
-
-def jget(url, params=None, headers=None, timeout=25):
+# =============== УТИЛИТЫ СОСТОЯНИЯ ===============
+def load_json(path, default):
     try:
-        r = requests.get(url, params=params or {}, headers=headers or HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
+        return default
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+def today_str():
+    return datetime.date.today().isoformat()
+
+def get_quota():
+    with STATE_LOCK:
+        q = load_json(QUOTA_FILE, {"date": today_str(), "news": 0, "signals": 0})
+        if q.get("date") != today_str():
+            q = {"date": today_str(), "news": 0, "signals": 0}
+            save_json(QUOTA_FILE, q)
+        return q
+
+def inc_quota(field):
+    with STATE_LOCK:
+        q = get_quota()
+        q[field] = q.get(field, 0) + 1
+        save_json(QUOTA_FILE, q)
+
+def add_history(title):
+    with STATE_LOCK:
+        h = load_json(HISTORY_FILE, [])
+        if title not in h:
+            h.append(title)
+            # ограничим память до последних 500 заголовков
+            if len(h) > 500:
+                h = h[-500:]
+            save_json(HISTORY_FILE, h)
+
+def was_sent(title):
+    h = load_json(HISTORY_FILE, [])
+    return title in h
+
+# ================= ЦЕНЫ (CoinGecko) =================
+# TOP_COINS — список id CoinGecko для /price и т.п.
+TOP_COINS_CG = [
+    "bitcoin","ethereum","bnb","solana","xrp","cardano","dogecoin","tron","toncoin","avalanche",
+    "polkadot","chainlink","matic-network","litecoin","uniswap","stellar","internet-computer",
+    "aptos","near","ethereum-classic"
+]
+
+def cg_price_map(ids):
+    url = f"{CG_SIMPLE_PRICE}?ids={','.join(ids)}&vs_currencies=usd"
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # вернуть только где есть usd
+        return {k: v["usd"] for k, v in data.items() if isinstance(v, dict) and "usd" in v}
+    except Exception as e:
+        print("[cg] error:", e)
         return {}
 
-def tget(url, timeout=25):
+def cg_price_one(sym):  # sym может быть и символом (BTC), и id (bitcoin)
+    sym_low = sym.lower()
+    # если это тикер типа BTC — попытка найти id
+    guess = None
+    for cg in TOP_COINS_CG:
+        if cg.startswith(sym_low) or sym_low in [cg, cg.replace("-","")]:
+            guess = cg
+            break
+    if guess is None:
+        guess = sym_low
+    mp = cg_price_map([guess])
+    return mp.get(guess)
+
+# ================= СВЕЧИ/ИНДИКАТОРЫ (Binance) =================
+def binance_klines(symbol="BTCUSDT", interval="15m", limit=200):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r = requests.get(BINANCE_KLINES, params=params, timeout=15)
         r.raise_for_status()
-        return r.text
-    except Exception:
-        return ""
+        raw = r.json()
+        closes = [float(x[4]) for x in raw]
+        return closes
+    except Exception as e:
+        print("[binance] klines error:", e)
+        return []
 
-# ---- top-20 из CoinGecko
-def top20_symbols():
-    if state["top20"]:
-        return state["top20"]
-    data = jget(f"{CG_BASE}/coins/markets",
-                {"vs_currency":"usd","order":"market_cap_desc","per_page":20,"page":1})
-    syms = []
-    for d in data or []:
-        s = (d.get("symbol") or "").upper()
-        if s: syms.append(s)
-    state["top20"] = syms or ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","TON","TRX","DOT",
-                              "AVAX","LINK","UNI","XLM","ICP","LTC","ATOM","NEAR","APT","ETC"]
-    return state["top20"]
-
-FAST_MAP = {
-    "BTC":"bitcoin","ETH":"ethereum","SOL":"solana","BNB":"binancecoin","XRP":"ripple",
-    "ADA":"cardano","DOGE":"dogecoin","TON":"the-open-network","TRX":"tron","DOT":"polkadot",
-    "AVAX":"avalanche-2","LINK":"chainlink","UNI":"uniswap","XLM":"stellar","ICP":"internet-computer",
-    "LTC":"litecoin","ATOM":"cosmos","NEAR":"near","APT":"aptos","ETC":"ethereum-classic"
-}
-def cg_id(symbol):
-    s = symbol.upper()
-    if s in FAST_MAP: return FAST_MAP[s]
-    lst = jget(f"{CG_BASE}/coins/list")
-    for it in lst or []:
-        if (it.get("symbol") or "").upper() == s:
-            return it.get("id")
-    return "bitcoin"
-
-def price_usd(sym):
-    _id = cg_id(sym)
-    data = jget(f"{CG_BASE}/simple/price", {"ids": _id, "vs_currencies":"usd"})
-    return (data.get(_id) or {}).get("usd")
-
-def market_chart(sym, days=2):
-    _id = cg_id(sym)
-    data = jget(f"{CG_BASE}/coins/{_id}/market_chart", {"vs_currency":"usd","days":days})
-    return data.get("prices") or []  # [[ts_ms, price], ...]
-
-# ========= TECHNICALS =========
-def ema(values, span):
-    if not values: return []
-    k = 2 / (span + 1.0)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(v * k + out[-1] * (1 - k))
+def ema(series, span):
+    if not series: return []
+    k = 2/(span+1.0)
+    out = [series[0]]
+    for v in series[1:]:
+        out.append(v*k + out[-1]*(1-k))
     return out
 
-def rsi(values, period=14):
-    if len(values) < period + 1: return []
+def rsi(series, period=14):
+    if len(series) < period+1: return []
     gains, losses = [], []
-    for i in range(1, len(values)):
-        ch = values[i] - values[i-1]
+    for i in range(1, len(series)):
+        ch = series[i] - series[i-1]
         gains.append(max(ch, 0.0))
         losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period])/period
+    avg_loss = sum(losses[:period])/period
     rsis = []
-    rs = avg_gain / avg_loss if avg_loss != 0 else math.inf
-    rsis.append(100 - (100 / (1 + rs)))
+    rs = (avg_gain/avg_loss) if avg_loss != 0 else math.inf
+    rsis.append(100 - 100/(1+rs))
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else math.inf
-        rsis.append(100 - (100 / (1 + rs)))
-    pad = len(values) - len(rsis)
+        avg_gain = (avg_gain*(period-1)+gains[i]) / period
+        avg_loss = (avg_loss*(period-1)+losses[i]) / period
+        rs = (avg_gain/avg_loss) if avg_loss != 0 else math.inf
+        rsis.append(100 - 100/(1+rs))
+    pad = len(series) - len(rsis)
     return [None]*pad + rsis
 
-def infer_direction(ys):
-    if len(ys) < 40:
+def infer_direction_from_closes(closes):
+    if len(closes) < 40:
         return "LONG", 0.4
-    ema10 = ema(ys, 10)
-    ema30 = ema(ys, 30)
-    rsi14 = rsi(ys, 14)
-    e10, e30 = ema10[-1], ema30[-1]
-    r = rsi14[-1] if rsi14 and rsi14[-1] is not None else 50.0
+    e10 = ema(closes, 10)[-1]
+    e30 = ema(closes, 30)[-1]
+    rsi14 = rsi(closes, 14)[-1] or 50.0
     dir_ema = 1 if e10 >= e30 else -1
-    dir_rsi = 1 if r >= 55 else (-1 if r <= 45 else 0)
+    dir_rsi = 1 if rsi14 >= 55 else (-1 if rsi14 <= 45 else 0)
     total = dir_ema + dir_rsi
     direction = "LONG" if total >= 0 else "SHORT"
-    rsi_conf = min(abs(r - 50) / 30.0, 1.0)
-    ema_conf = min(abs(e10 - e30) / (0.01 * ys[-1] + 1e-9), 1.0)
-    confidence = max(0.15, min(1.0, 0.5*rsi_conf + 0.5*ema_conf))
-    return direction, confidence
+    rsi_conf = min(abs(rsi14 - 50) / 30.0, 1.0)
+    ema_conf = min(abs(e10 - e30) / (0.01 * closes[-1] + 1e-9), 1.0)
+    conf = max(0.15, min(1.0, 0.5*rsi_conf + 0.5*ema_conf))
+    return direction, conf
 
 def leverage_from_conf(conf):
-    lvl = BASE_LEVERAGE_MIN + int(round(conf * (BASE_LEVERAGE_MAX - BASE_LEVERAGE_MIN)))
-    return max(BASE_LEVERAGE_MIN, min(BASE_LEVERAGE_MAX, lvl))
+    base_min, base_max = 2, 7
+    lvl = base_min + int(round(conf*(base_max-base_min)))
+    return max(base_min, min(base_max, lvl))
 
-# ========= PICK SYMBOL =========
-def pick_symbol():
-    try:
-        if LUNAR:
-            syms = ",".join(top20_symbols())
-            j = jget("https://api.lunarcrush.com/v2",
-                     {"data":"assets","symbol":syms},
-                     headers={"Authorization": f"Bearer {LUNAR}"})
-            best, gmax = None, -1
-            for row in (j.get("data") or []):
-                g = row.get("galaxy_score") or 0
-                if g > gmax:
-                    gmax, best = g, row.get("symbol")
-            if best: return best
-    except Exception:
-        pass
-    # fallback: монета с наибольшей дивергенцией EMA
-    best, best_div = "BTC", -1
-    for s in top20_symbols():
-        data = market_chart(s, days=2)
-        ys = [p[1] for p in data][-60:]
-        if len(ys) < 30: continue
-        e10, e30 = ema(ys, 10)[-1], ema(ys, 30)[-1]
-        div = abs(e10 - e30) / (ys[-1] + 1e-9)
-        if div > best_div:
-            best_div, best = div, s
-    return best
-
-# ========= SIGNALS =========
-def chart_image(sym, entry, tp, sl):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import datetime as pdt
-    data = market_chart(sym, days=2)
-    if not data: return None
-    xs = [pdt.datetime.utcfromtimestamp(p[0]/1000.0) for p in data]
-    ys = [p[1] for p in data]
-    fig = plt.figure(figsize=(7,3.4), dpi=160)
-    ax = plt.gca()
-    ax.plot(xs, ys, linewidth=1.8, label=f"{sym} • ~48ч")
-    ax.axhline(entry, linestyle="--", linewidth=1.2, label=f"Вход {entry:,.2f}")
-    ax.axhline(tp,    linestyle="--", linewidth=1.2, label=f"Тейк {tp:,.2f}")
-    ax.axhline(sl,    linestyle="--", linewidth=1.2, label=f"Стоп {sl:,.2f}")
-    ax.legend(loc="upper left"); ax.set_ylabel("USD"); ax.grid(True, alpha=0.25)
-    buf = io.BytesIO(); fig.tight_layout(); plt.savefig(buf, format="png"); plt.close(fig); buf.seek(0)
-    return buf
-
-def build_signal(sym="BTC", equity=1000.0):
-    p = price_usd(sym)
-    if p is None: return None
-    hist = market_chart(sym, days=2)
-    ys = [v[1] for v in hist]
-    direction, conf = infer_direction(ys)
+def build_signal_for_cgid(cg_id="bitcoin", equity=1000.0):
+    symbol = SYMBOL_MAP.get(cg_id, "BTCUSDT")
+    closes = binance_klines(symbol, "15m", 200)
+    if len(closes) < 40:
+        return None
+    entry = float(closes[-1])
+    direction, conf = infer_direction_from_closes(closes)
     lev = leverage_from_conf(conf)
-
-    entry = float(p)
     if direction == "LONG":
         tp, sl = entry * 1.025, entry * 0.985
     else:
         tp, sl = entry * 0.975, entry * 1.015
-
     stop_dist = abs(entry - sl)
-    qty = (equity * RISK_PER_TRADE) / (stop_dist if stop_dist > 0 else (0.001*entry))
+    qty = (equity * 0.05) / (stop_dist if stop_dist > 0 else (0.001*entry))
     notional, cap = qty * entry, equity * lev
     if notional > cap:
         qty *= cap / (notional + 1e-9)
-
-    img = chart_image(sym, entry, tp, sl)
+    coin = symbol.replace("USDT","")
     text = (
-        f"📊 Сигнал по {sym}\n\n"
+        f"📊 Сигнал по {coin}\n\n"
         f"🎯 Вход: {entry:,.4f} $\n"
         f"💰 Тейк: {tp:,.4f} $\n"
         f"🛑 Стоп: {sl:,.4f} $\n\n"
         f"⚖ Плечо: x{lev}\n"
-        f"💵 Риск: {int(RISK_PER_TRADE*100)}% от депозита\n"
-        f"Размер позиции ≈ {qty:,.6f} {sym}\n"
+        f"💵 Риск: 5% от депозита\n"
+        f"Размер позиции ≈ {qty:,.6f} {coin}\n"
         f"Направление: {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
         f"Уверенность: {int(conf*100)}%\n"
-        f"#signal #{sym.lower()} #crypto"
+        f"#signal #{coin.lower()} #crypto"
     )
-    return text, img
+    return text
 
-def post_signal_once():
-    reset_counters_if_new_day()
-    if state["signals"] >= MAX_SIGNALS_PER_DAY: return
-    try:
-        sym = pick_symbol()
-        payload = build_signal(sym, equity=1000.0)
-        if not payload: return
-        text, img = payload
-        if img: bot.send_photo(TRADING_CHAT, img, caption=text)
-        else:   bot.send_message(TRADING_CHAT, text)
-        state["signals"] += 1
-        print(f"[signal] {sym} posted")
-    except Exception as e:
-        bot.send_message(TRADING_CHAT, f"⚠️ Ошибка сигнала: {e}")
-
-# ========= NEWS: RSS + LunarCrush =========
-def parse_rss(url, limit=10):
+# ================ НОВОСТИ (RSS ≤ 4 часов, без повторов) ================
+def parse_rss(url, max_items=20):
     out = []
-    xml = tget(url)
-    if not xml: return out
     try:
-        root = ET.fromstring(xml)
-        for item in root.iterfind(".//item")[:limit]:
+        raw = requests.get(url, timeout=20).text
+        root = ET.fromstring(raw)
+        for item in root.findall(".//item")[:max_items]:
             title = (item.findtext("title") or "").strip()
             link  = (item.findtext("link") or "").strip()
-            out.append((title, link))
-    except Exception:
-        pass
-    return out
-
-def lunar_spikes():
-    if not LUNAR: return []
-    syms = ",".join(top20_symbols())
-    j = jget("https://api.lunarcrush.com/v2",
-             {"data":"assets","symbol":syms},
-             headers={"Authorization": f"Bearer {LUNAR}"})
-    out = []
-    for row in (j.get("data") or []):
-        sym = row.get("symbol"); g = row.get("galaxy_score") or 0; vol = row.get("social_volume") or 0
-        if g >= 60 or vol >= 500:
-            out.append((f"🔥 Соц-всплеск по {sym}: GalaxyScore {g}, обсуждения {vol}.", None, sym))
-    return out
-
-def select_news_messages():
-    reset_counters_if_new_day()
-    if state["news"] >= MAX_NEWS_PER_DAY: return []
-    candidates = []
-    for feed in RSS_FEEDS:
-        candidates += parse_rss(feed, limit=8)
-    spikes = lunar_spikes()
-
-    selected = []
-    t20 = set(s.lower() for s in top20_symbols())
-    for (title, link) in candidates:
-        t = (title or "").lower()
-        by_symbol = any(f" {s} " in f" {t} " for s in t20)
-        influencer = any(k in t for k in INFLUENCER_HINTS)
-        important = any(k in t for k in ["bitcoin","btc","ethereum","eth","binance","coinbase","sec","etf","listing","spot","hack","airdrop","upgrade","trump","musk","fed","powell"])
-        if important or by_symbol or influencer:
-            msg = f"📰 {title}"
-            if link: msg += f"\nПодробнее: {link}"
-            msg += "\n#CryptoNews #Market"
-            selected.append(msg)
-        if len(selected) >= MAX_NEWS_PER_DAY: break
-
-    for (txt, link, sym) in spikes:
-        if len(selected) >= MAX_NEWS_PER_DAY: break
-        msg = f"📰 {txt}"
-        if link: msg += f"\nПодробнее: {link}"
-        if sym:  msg += f"\n#{sym.lower()} #Social"
-        msg += "\n#CryptoNews #Market"
-        selected.append(msg)
-    return selected
-
-def post_news_once():
-    reset_counters_if_new_day()
-    if state["news"] >= MAX_NEWS_PER_DAY: return
-    try:
-        msgs = select_news_messages()
-        for m in msgs:
-            if state["news"] >= MAX_NEWS_PER_DAY: break
-            if m in _seen_links:  # на всякий случай
+            pub   = (item.findtext("pubDate") or "").strip()
+            if not title or not link or not pub:
                 continue
-            bot.send_message(NEWS_CHAT, m)
-            _seen_links.add(m)
-            state["news"] += 1
-            print("[news] posted")
-            time.sleep(2)
-    except Exception as e:
-        bot.send_message(NEWS_CHAT, f"⚠️ Ошибка новостей: {e}")
-
-# ========= FREE INFLUENCER MONITOR (web scraping) =========
-def clean_text(txt):
-    return re.sub(r"\s+", " ", (txt or "").strip())
-
-def scrape_influencer_page(url, who):
-    html = tget(url)
-    out = []
-    if not html: return out
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        # берём все ссылки с более-менее осмысленным текстом
-        for a in soup.find_all("a", href=True):
-            title = clean_text(a.get_text())
-            href  = a["href"]
-            if not title or len(title) < 30:  # короткие заголовки отпад
-                continue
-            low = title.lower()
-            if any(k in low for k in INFLUENCER_HINTS):
-                # абсолютная ссылка
-                if href.startswith("/"):
-                    # пытаемся восстановить домен
-                    from urllib.parse import urlparse, urljoin
-                    base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(url))
-                    href = urljoin(base, href)
-                # формируем пост
-                post = f"💬 {who}: {title}\nИсточник: {href}\n#influencer"
-                out.append(post)
-                if len(out) >= 3:
-                    break
-    except Exception:
-        pass
-    return out
-
-def check_influencers():
-    msgs = []
-    for who, urls in INFLUENCER_SOURCES.items():
-        for u in urls:
             try:
-                items = scrape_influencer_page(u, who)
-                for m in items:
-                    if m in _seen_influencer:  # дедупликация
-                        continue
-                    _seen_influencer.add(m)
-                    msgs.append(m)
-                    if len(msgs) >= 5:
-                        return msgs
+                # пример формата: "Sat, 18 Oct 2025 00:24:00 +0000"
+                dt = datetime.datetime.strptime(pub[:25], "%a, %d %b %Y %H:%M:%S")
             except Exception:
-                continue
-    return msgs
-
-# ========= SCHEDULER =========
-def scheduler_loop():
-    last_news, last_sig, last_inf = 0, 0, 0
-    while True:
-        now = time.time()
-        # Новости (каждые 30 мин)
-        if now - last_news >= 30*60:
-            post_news_once(); last_news = now
-        # Сигналы (каждые 3 часа, до 2/сутки)
-        if now - last_sig >= 3*60*60:
-            post_signal_once(); last_sig = now
-        # Инфлюенсеры (каждые 20 мин)
-        if now - last_inf >= 20*60:
-            infl = check_influencers()
-            for m in infl:
-                reset_counters_if_new_day()
-                if state["news"] < MAX_NEWS_PER_DAY:
-                    bot.send_message(NEWS_CHAT, m)
-                    state["news"] += 1
-                    time.sleep(2)
-            last_inf = now
-        time.sleep(12)
-
-# ========= WEBHOOK =========
-WEBHOOK_PATH = f"/{TOKEN}"
-
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def webhook():
-    js = request.stream.read().decode("utf-8")
-    upd = telebot.types.Update.de_json(js)
-    bot.process_new_updates([upd])
-    return "OK", 200
-
-@app.route("/", methods=["GET"])
-def index():
-    return "OK", 200
-
-# ========= COMMANDS =========
-@bot.message_handler(commands=["start"])
-def start_cmd(m):
-    bot.send_message(m.chat.id, "Привет! Новости (до 7/день), сигналы LONG/SHORT (до 2/день) по EMA+RSI. Следим за Маском/Трампом/и др. через открытые источники. Это не финсовет.")
-
-@bot.message_handler(commands=["price"])
-def price_cmd(m):
-    try:
-        parts = m.text.split()
-        sym = parts[1].upper() if len(parts) > 1 else "BTC"
-        p = price_usd(sym)
-        if p is None:
-            bot.send_message(m.chat.id, f"Не смог получить цену для {sym}")
-            return
-        bot.send_message(m.chat.id, f"{sym}: ${p:,.6f}")
+                # попробуем ISO
+                try:
+                    dt = datetime.datetime.fromisoformat(pub.replace("Z","+00:00").split("+")[0])
+                except Exception:
+                    continue
+            age_h = (datetime.datetime.utcnow() - dt).total_seconds() / 3600.0
+            if age_h <= 4.0:  # только свежие
+                out.append({"title": title, "link": link, "age_h": age_h})
     except Exception as e:
-        bot.send_message(m.chat.id, f"Ошибка /price: {e}")
+        print("[rss] parse error:", e)
+    return out
 
-@bot.message_handler(commands=["signal"])
-def manual_signal(m):
-    post_signal_once()
-    bot.send_message(m.chat.id, "✅ Сигнал отправлен (если дневной лимит не исчерпан).")
+def is_crypto_related(title):
+    t = title.upper()
+    return any(k in t for k in NEWS_KEYWORDS)
 
-@bot.message_handler(commands=["news"])
-def manual_news(m):
-    post_news_once()
-    bot.send_message(m.chat.id, "✅ Новости отправлены (если дневной лимит не исчерпан).")
+def collect_fresh_news():
+    items = []
+    for src in RSS_SOURCES:
+        items.extend(parse_rss(src, max_items=30))
+    # фильтр по крипто/монетам/инфлюенсерам
+    items = [it for it in items if is_crypto_related(it["title"])]
+    # анти-дубли по заголовку
+    items = [it for it in items if not was_sent(it["title"])]
+    # сортировка: самые свежие вперёд
+    items.sort(key=lambda x: x["age_h"])
+    # ограничим итоговый набор до 20 кандидатов (перед квотой)
+    return items[:20]
+
+def post_news_batch():
+    q = get_quota()
+    if q["news"] >= MAX_NEWS_PER_DAY:
+        return
+    # берём свежие
+    items = collect_fresh_news()
+    if not items:
+        return
+    # сколько можем отправить
+    can = MAX_NEWS_PER_DAY - q["news"]
+    batch = items[:can]
+    for it in batch:
+        title, link = it["title"], it["link"]
+        try:
+            bot.send_message(NEWS_CHAT_ID, f"📰 {title}\n🔗 {link}\n#CryptoNews")
+            add_history(title)
+            inc_quota("news")
+            time.sleep(2)
+        except Exception as e:
+            print("[tg] news send error:", e)
+
+# ================== АВТО-СИГНАЛЫ ==================
+def pick_symbols_for_signals(n=2):
+    # простой выбор: два верхних CG-ид среди списка (можешь заменить на «наибольшая дивергенция EMA»)
+    universe = ["bitcoin","ethereum","solana","bnb","xrp","cardano","dogecoin","tron","toncoin","avalanche"]
+    return universe[:n]
+
+def post_signals_batch():
+    q = get_quota()
+    if q["signals"] >= MAX_SIGNALS_PER_DAY:
+        return
+    can = MAX_SIGNALS_PER_DAY - q["signals"]
+    # один батч — максимум 2 за раз, чтобы не спамить
+    per_run = min(2, can)
+    picked = pick_symbols_for_signals(per_run)
+    for cid in picked:
+        try:
+            s = build_signal_for_cgid(cg_id=cid, equity=1000.0)
+            if s:
+                bot.send_message(SIGNAL_CHAT_ID, s)
+                inc_quota("signals")
+                time.sleep(2)
+        except Exception as e:
+            print("[tg] signal send error:", e)
+
+# ================== РАСПИСАНИЕ (schedule) ==================
+def scheduler_thread():
+    # каждые 3 часа — новости
+    schedule.every(3).hours.do(post_news_batch)
+    # каждые 6 часов — сигналы (в сумме до 4/день, контролирует квота)
+    schedule.every(6).hours.do(post_signals_batch)
+    # ежедневный сброс квот (на случай, если файл не сменился)
+    schedule.every().day.at("00:05").do(lambda: save_json(QUOTA_FILE, {"date": today_str(), "news": 0, "signals": 0}))
+    # первый запуск сразу после старта (чтобы не ждать часа)
+    time.sleep(5)
+    try:
+        post_news_batch()
+        post_signals_batch()
+    except Exception as e:
+        print("[init run] error:", e)
+    # основной цикл
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            print("[scheduler] error:", e)
+        time.sleep(5)
+
+# ================== КОМАНДЫ ==================
+@bot.message_handler(commands=["start"])
+def cmd_start(m):
+    bot.reply_to(m, "👋 Привет! Я CryptoBot v6.5 AutoTrader — публикую свежие новости (≤4ч) и сигналы (EMA/RSI). Это не финсовет.")
 
 @bot.message_handler(commands=["version"])
-def version_cmd(m):
-    lunar = "ON" if LUNAR else "OFF"
-    bot.send_message(m.chat.id, f"Version: {VERSION}\nPrices: CoinGecko\nLunarCrush: {lunar}\nInfluencers: FREE Web\nWebhooks: ON")
+def cmd_version(m):
+    q = get_quota()
+    bot.reply_to(m, f"Version: v6.5 AutoTrader\nNews today: {q['news']}/{MAX_NEWS_PER_DAY}\nSignals today: {q['signals']}/{MAX_SIGNALS_PER_DAY}\nSources: CoinGecko + Binance + RSS")
 
-# ========= RUN =========
-def run_bg():
-    t = threading.Thread(target=scheduler_loop, daemon=True)
+@bot.message_handler(commands=["price"])
+def cmd_price(m):
+    parts = m.text.split()
+    if len(parts) < 2:
+        bot.reply_to(m, "Использование: /price BTC")
+        return
+    coin = parts[1]
+    p = cg_price_one(coin)
+    if p is None:
+        bot.reply_to(m, f"❌ Не смог получить цену для {coin.upper()}")
+    else:
+        bot.reply_to(m, f"💰 {coin.upper()}: ${p:,.6f}")
+
+@bot.message_handler(commands=["news"])
+def cmd_news(m):
+    post_news_batch()
+    bot.reply_to(m, "✅ Проверил и опубликовал свежие новости (если были и лимит не исчерпан).")
+
+@bot.message_handler(commands=["signal"])
+def cmd_signal(m):
+    post_signals_batch()
+    bot.reply_to(m, "✅ Сигналы сгенерированы (если лимит не исчерпан).")
+
+# ================== ЗАПУСК ==================
+def run_scheduler():
+    t = threading.Thread(target=scheduler_thread, daemon=True)
     t.start()
 
 if __name__ == "__main__":
-    print("✅ bot starting…", VERSION)
-    run_bg()
-    app.run(host="0.0.0.0", port=PORT)
+    print("✅ CryptoBot v6.5 AutoTrader starting...")
+    run_scheduler()
+    # на Render/Termux — запуск через polling
+    bot.infinity_polling(timeout=60, long_polling_timeout=30)
