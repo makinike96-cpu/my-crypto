@@ -1,19 +1,14 @@
-# v6.1 — LONG & SHORT (EMA+RSI), CoinGecko, RSS+LunarCrush news, Twitter influencers (tweepy), 24/7
-import os, io, time, threading, datetime as dt, math
+# v6.2 — LONG/SHORT (EMA+RSI), CoinGecko, RSS+LunarCrush news, FREE influencer monitor (web scraping), 24/7
+import os, io, time, threading, datetime as dt, math, re
 from flask import Flask, request
 import requests, xml.etree.ElementTree as ET
 import telebot
+from bs4 import BeautifulSoup
 
 # ========= ENV / CONFIG =========
 TOKEN    = os.getenv("TOKEN")                    # Telegram bot token (Render → Environment)
-LUNAR    = os.getenv("LUNARCRUSH_KEY")          # LunarCrush Bearer (Render → Environment)
+LUNAR    = os.getenv("LUNARCRUSH_KEY")          # LunarCrush Bearer (Render → Environment, опционально)
 PORT     = int(os.environ.get("PORT", 10000))
-
-# Twitter API (X) — OAuth1 (user context)
-TWITTER_API_KEY       = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET    = os.getenv("TWITTER_API_SECRET")
-TWITTER_ACCESS_TOKEN  = os.getenv("TWITTER_ACCESS_TOKEN")
-TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
 
 TRADING_CHAT = -1003166387118   # Аналитика
 NEWS_CHAT    = -1002969047835   # Новости
@@ -24,23 +19,60 @@ BASE_LEVERAGE_MIN   = 2
 BASE_LEVERAGE_MAX   = 7
 RISK_PER_TRADE      = 0.05       # 5% от депозита
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CryptoPulseBot/1.0)"}
 CG_BASE = "https://api.coingecko.com/api/v3"
+
+# RSS-ленты (легальные и бесплатные)
 RSS_FEEDS = [
     "https://www.binance.com/en/blog/rss",
     "https://cointelegraph.com/rss",
 ]
+
+# имена/ключи влияющих персон для фильтрации
 INFLUENCER_HINTS = [
-    "elon", "musk", "trump", "saylor", "buterin", "cz", "gensler",
+    "elon", "musk", "трамп", "trump", "saylor", "buterin", "vitalik",
+    "cz", "zhao", "gensler", "powell", "fed", "фрс",
     "sec", "etf", "listing", "blackrock", "fidelity", "coinbase", "binance",
-    "airdrop", "upgrade", "hack", "btc", "eth", "crypto", "bitcoin", "market", "pump", "dump"
+    "airdrop", "upgrade", "hack", "btc", "bitcoin", "eth", "crypto", "рынок"
 ]
 
-VERSION = "v6.1-EMA-RSI-TW"
+# бесплатные веб-источники, где часто дублируют/цитируют твиты и заявления инфлюенсеров
+INFLUENCER_SOURCES = {
+    "Илон Маск": [
+        "https://decrypt.co/tag/elon-musk",
+        "https://www.coindesk.com/tag/elon-musk/",
+        "https://watcher.guru/news/tag/elon-musk",
+    ],
+    "Дональд Трамп": [
+        "https://decrypt.co/tag/donald-trump",
+        "https://www.coindesk.com/tag/donald-trump/",
+        "https://watcher.guru/news/tag/donald-trump",
+    ],
+    "CZ (Binance)": [
+        "https://www.coindesk.com/tag/binance/",
+        "https://watcher.guru/news/tag/binance",
+    ],
+    "Майкл Сэйлор": [
+        "https://decrypt.co/tag/michael-saylor",
+        "https://www.coindesk.com/tag/microstrategy/",
+    ],
+    "Виталик Бутерин": [
+        "https://www.coindesk.com/tag/vitalik-buterin/",
+        "https://decrypt.co/tag/vitalik-buterin",
+    ],
+    "ФРС/ставки": [
+        "https://www.coindesk.com/tag/federal-reserve/",
+        "https://www.investopedia.com/markets-news-4427704",  # общая финлента, фильтруем по rate/fed
+    ],
+}
+
+VERSION = "v6.2-EMA-RSI-FREE-INF"
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 state = {"date": dt.date.today(), "news": 0, "signals": 0, "top20": []}
+_seen_links = set()         # чтобы не постить одно и то же
+_seen_influencer = set()    # для дублирующихся ссылок по инфлюенсерам
 
 # ========= HELPERS =========
 def reset_counters_if_new_day():
@@ -66,6 +98,7 @@ def tget(url, timeout=25):
     except Exception:
         return ""
 
+# ---- top-20 из CoinGecko
 def top20_symbols():
     if state["top20"]:
         return state["top20"]
@@ -170,6 +203,7 @@ def pick_symbol():
             if best: return best
     except Exception:
         pass
+    # fallback: монета с наибольшей дивергенцией EMA
     best, best_div = "BTC", -1
     for s in top20_symbols():
         data = market_chart(s, days=2)
@@ -293,7 +327,7 @@ def select_news_messages():
         t = (title or "").lower()
         by_symbol = any(f" {s} " in f" {t} " for s in t20)
         influencer = any(k in t for k in INFLUENCER_HINTS)
-        important = any(k in t for k in ["bitcoin","btc","ethereum","eth","binance","coinbase","sec","etf","listing","spot","hack","airdrop","upgrade","trump","musk"])
+        important = any(k in t for k in ["bitcoin","btc","ethereum","eth","binance","coinbase","sec","etf","listing","spot","hack","airdrop","upgrade","trump","musk","fed","powell"])
         if important or by_symbol or influencer:
             msg = f"📰 {title}"
             if link: msg += f"\nПодробнее: {link}"
@@ -317,74 +351,79 @@ def post_news_once():
         msgs = select_news_messages()
         for m in msgs:
             if state["news"] >= MAX_NEWS_PER_DAY: break
+            if m in _seen_links:  # на всякий случай
+                continue
             bot.send_message(NEWS_CHAT, m)
+            _seen_links.add(m)
             state["news"] += 1
             print("[news] posted")
             time.sleep(2)
     except Exception as e:
         bot.send_message(NEWS_CHAT, f"⚠️ Ошибка новостей: {e}")
 
-# ========= TWITTER / INFLUENCERS =========
-def twitter_enabled():
-    return all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET])
+# ========= FREE INFLUENCER MONITOR (web scraping) =========
+def clean_text(txt):
+    return re.sub(r"\s+", " ", (txt or "").strip())
 
-influencers = {
-    "elonmusk": "Илон Маск",
-    "realDonaldTrump": "Дональд Трамп",
-    "cz_binance": "CZ (Binance)",
-    "saylor": "Майкл Сэйлор",
-    "VitalikButerin": "Виталик Бутерин"
-}
-
-_last_tweet_id = {}  # username -> last_id (чтобы не постить одно и то же)
+def scrape_influencer_page(url, who):
+    html = tget(url)
+    out = []
+    if not html: return out
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        # берём все ссылки с более-менее осмысленным текстом
+        for a in soup.find_all("a", href=True):
+            title = clean_text(a.get_text())
+            href  = a["href"]
+            if not title or len(title) < 30:  # короткие заголовки отпад
+                continue
+            low = title.lower()
+            if any(k in low for k in INFLUENCER_HINTS):
+                # абсолютная ссылка
+                if href.startswith("/"):
+                    # пытаемся восстановить домен
+                    from urllib.parse import urlparse, urljoin
+                    base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(url))
+                    href = urljoin(base, href)
+                # формируем пост
+                post = f"💬 {who}: {title}\nИсточник: {href}\n#influencer"
+                out.append(post)
+                if len(out) >= 3:
+                    break
+    except Exception:
+        pass
+    return out
 
 def check_influencers():
-    if not twitter_enabled():
-        return []
-    try:
-        import tweepy
-        auth = tweepy.OAuth1UserHandler(
-            TWITTER_API_KEY, TWITTER_API_SECRET,
-            TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
-        )
-        api = tweepy.API(auth, wait_on_rate_limit=True)
-    except Exception as e:
-        print(f"[twitter auth error] {e}")
-        return []
-
-    alerts = []
-    for username, pretty in influencers.items():
-        try:
-            tweets = api.user_timeline(screen_name=username, count=5, tweet_mode="extended", since_id=_last_tweet_id.get(username))
-            max_id = _last_tweet_id.get(username, 0)
-            for t in tweets:
-                text = (t.full_text or "").strip()
-                t_low = text.lower()
-                if any(k in t_low for k in INFLUENCER_HINTS):
-                    url = f"https://twitter.com/{username}/status/{t.id}"
-                    msg = f"💬 {pretty} написал(а):\n{text}\nСсылка: {url}\n#influencer #{username}"
-                    alerts.append(msg)
-                if t.id > max_id:
-                    max_id = t.id
-            if max_id:
-                _last_tweet_id[username] = max_id
-        except Exception as e:
-            print(f"[twitter fetch error] {username}: {e}")
-    return alerts
+    msgs = []
+    for who, urls in INFLUENCER_SOURCES.items():
+        for u in urls:
+            try:
+                items = scrape_influencer_page(u, who)
+                for m in items:
+                    if m in _seen_influencer:  # дедупликация
+                        continue
+                    _seen_influencer.add(m)
+                    msgs.append(m)
+                    if len(msgs) >= 5:
+                        return msgs
+            except Exception:
+                continue
+    return msgs
 
 # ========= SCHEDULER =========
 def scheduler_loop():
-    last_news, last_sig, last_tw = 0, 0, 0
+    last_news, last_sig, last_inf = 0, 0, 0
     while True:
         now = time.time()
-        # Новости (каждые 30 мин, до лимита)
+        # Новости (каждые 30 мин)
         if now - last_news >= 30*60:
             post_news_once(); last_news = now
         # Сигналы (каждые 3 часа, до 2/сутки)
         if now - last_sig >= 3*60*60:
             post_signal_once(); last_sig = now
         # Инфлюенсеры (каждые 20 мин)
-        if now - last_tw >= 20*60:
+        if now - last_inf >= 20*60:
             infl = check_influencers()
             for m in infl:
                 reset_counters_if_new_day()
@@ -392,7 +431,7 @@ def scheduler_loop():
                     bot.send_message(NEWS_CHAT, m)
                     state["news"] += 1
                     time.sleep(2)
-            last_tw = now
+            last_inf = now
         time.sleep(12)
 
 # ========= WEBHOOK =========
@@ -412,7 +451,7 @@ def index():
 # ========= COMMANDS =========
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
-    bot.send_message(m.chat.id, "Привет! Публикую новости (до 7/день) и сигналы (до 2/день), LONG/SHORT по EMA+RSI. Отслеживаю инфлюенсеров (Маск/Трамп/и др.). Это не финсовет.")
+    bot.send_message(m.chat.id, "Привет! Новости (до 7/день), сигналы LONG/SHORT (до 2/день) по EMA+RSI. Следим за Маском/Трампом/и др. через открытые источники. Это не финсовет.")
 
 @bot.message_handler(commands=["price"])
 def price_cmd(m):
@@ -440,8 +479,7 @@ def manual_news(m):
 @bot.message_handler(commands=["version"])
 def version_cmd(m):
     lunar = "ON" if LUNAR else "OFF"
-    tw = "ON" if twitter_enabled() else "OFF"
-    bot.send_message(m.chat.id, f"Version: {VERSION}\nPrices: CoinGecko\nLunarCrush: {lunar}\nTwitter: {tw}\nWebhooks: ON")
+    bot.send_message(m.chat.id, f"Version: {VERSION}\nPrices: CoinGecko\nLunarCrush: {lunar}\nInfluencers: FREE Web\nWebhooks: ON")
 
 # ========= RUN =========
 def run_bg():
@@ -452,4 +490,3 @@ if __name__ == "__main__":
     print("✅ bot starting…", VERSION)
     run_bg()
     app.run(host="0.0.0.0", port=PORT)
-
