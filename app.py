@@ -1,21 +1,28 @@
-# v5.2 — auto news + auto signals + real CoinGecko prices (top-20 only)
-import os, io, time, threading, datetime as dt
+# v6.1 — LONG & SHORT (EMA+RSI), CoinGecko, RSS+LunarCrush news, Twitter influencers (tweepy), 24/7
+import os, io, time, threading, datetime as dt, math
 from flask import Flask, request
 import requests, xml.etree.ElementTree as ET
 import telebot
 
 # ========= ENV / CONFIG =========
-TOKEN    = os.getenv("TOKEN")                   # Telegram bot token (Render → Environment)
+TOKEN    = os.getenv("TOKEN")                    # Telegram bot token (Render → Environment)
 LUNAR    = os.getenv("LUNARCRUSH_KEY")          # LunarCrush Bearer (Render → Environment)
 PORT     = int(os.environ.get("PORT", 10000))
+
+# Twitter API (X) — OAuth1 (user context)
+TWITTER_API_KEY       = os.getenv("TWITTER_API_KEY")
+TWITTER_API_SECRET    = os.getenv("TWITTER_API_SECRET")
+TWITTER_ACCESS_TOKEN  = os.getenv("TWITTER_ACCESS_TOKEN")
+TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
 
 TRADING_CHAT = -1003166387118   # Аналитика
 NEWS_CHAT    = -1002969047835   # Новости
 
 MAX_NEWS_PER_DAY    = 7
 MAX_SIGNALS_PER_DAY = 2
-DEFAULT_LEVERAGE    = 2
-RISK_PER_TRADE      = 0.05
+BASE_LEVERAGE_MIN   = 2
+BASE_LEVERAGE_MAX   = 7
+RISK_PER_TRADE      = 0.05       # 5% от депозита
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 CG_BASE = "https://api.coingecko.com/api/v3"
@@ -26,10 +33,10 @@ RSS_FEEDS = [
 INFLUENCER_HINTS = [
     "elon", "musk", "trump", "saylor", "buterin", "cz", "gensler",
     "sec", "etf", "listing", "blackrock", "fidelity", "coinbase", "binance",
-    "airdrop", "upgrade", "hack"
+    "airdrop", "upgrade", "hack", "btc", "eth", "crypto", "bitcoin", "market", "pump", "dump"
 ]
 
-VERSION = "v5.2-CG"
+VERSION = "v6.1-EMA-RSI-TW"
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
@@ -43,7 +50,7 @@ def reset_counters_if_new_day():
         state["news"] = 0
         state["signals"] = 0
 
-def jget(url, params=None, headers=None, timeout=20):
+def jget(url, params=None, headers=None, timeout=25):
     try:
         r = requests.get(url, params=params or {}, headers=headers or HEADERS, timeout=timeout)
         r.raise_for_status()
@@ -51,7 +58,7 @@ def jget(url, params=None, headers=None, timeout=20):
     except Exception:
         return {}
 
-def tget(url, timeout=20):
+def tget(url, timeout=25):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         r.raise_for_status()
@@ -68,9 +75,8 @@ def top20_symbols():
     for d in data or []:
         s = (d.get("symbol") or "").upper()
         if s: syms.append(s)
-    # fallback на случай недоступности API
     state["top20"] = syms or ["BTC","ETH","SOL","BNB","XRP","ADA","DOGE","TON","TRX","DOT",
-                              "AVAX","LINK","UNI","XLM","ICP","LTC","ATOM","NEAR","APT"]
+                              "AVAX","LINK","UNI","XLM","ICP","LTC","ATOM","NEAR","APT","ETC"]
     return state["top20"]
 
 FAST_MAP = {
@@ -82,7 +88,6 @@ FAST_MAP = {
 def cg_id(symbol):
     s = symbol.upper()
     if s in FAST_MAP: return FAST_MAP[s]
-    # запасной путь — поиск по списку монет
     lst = jget(f"{CG_BASE}/coins/list")
     for it in lst or []:
         if (it.get("symbol") or "").upper() == s:
@@ -97,18 +102,59 @@ def price_usd(sym):
 def market_chart(sym, days=2):
     _id = cg_id(sym)
     data = jget(f"{CG_BASE}/coins/{_id}/market_chart", {"vs_currency":"usd","days":days})
-    return data.get("prices") or []
+    return data.get("prices") or []  # [[ts_ms, price], ...]
 
-def ma(values, window):
-    if len(values) < window: return []
-    out, s = [], sum(values[:window])
-    out.append(s/window)
-    for i in range(window, len(values)):
-        s += values[i] - values[i-window]
-        out.append(s/window)
+# ========= TECHNICALS =========
+def ema(values, span):
+    if not values: return []
+    k = 2 / (span + 1.0)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
     return out
 
-# ========= PICK SYMBOL (LunarCrush if available, else BTC) =========
+def rsi(values, period=14):
+    if len(values) < period + 1: return []
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        ch = values[i] - values[i-1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsis = []
+    rs = avg_gain / avg_loss if avg_loss != 0 else math.inf
+    rsis.append(100 - (100 / (1 + rs)))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / avg_loss if avg_loss != 0 else math.inf
+        rsis.append(100 - (100 / (1 + rs)))
+    pad = len(values) - len(rsis)
+    return [None]*pad + rsis
+
+def infer_direction(ys):
+    if len(ys) < 40:
+        return "LONG", 0.4
+    ema10 = ema(ys, 10)
+    ema30 = ema(ys, 30)
+    rsi14 = rsi(ys, 14)
+    e10, e30 = ema10[-1], ema30[-1]
+    r = rsi14[-1] if rsi14 and rsi14[-1] is not None else 50.0
+    dir_ema = 1 if e10 >= e30 else -1
+    dir_rsi = 1 if r >= 55 else (-1 if r <= 45 else 0)
+    total = dir_ema + dir_rsi
+    direction = "LONG" if total >= 0 else "SHORT"
+    rsi_conf = min(abs(r - 50) / 30.0, 1.0)
+    ema_conf = min(abs(e10 - e30) / (0.01 * ys[-1] + 1e-9), 1.0)
+    confidence = max(0.15, min(1.0, 0.5*rsi_conf + 0.5*ema_conf))
+    return direction, confidence
+
+def leverage_from_conf(conf):
+    lvl = BASE_LEVERAGE_MIN + int(round(conf * (BASE_LEVERAGE_MAX - BASE_LEVERAGE_MIN)))
+    return max(BASE_LEVERAGE_MIN, min(BASE_LEVERAGE_MAX, lvl))
+
+# ========= PICK SYMBOL =========
 def pick_symbol():
     try:
         if LUNAR:
@@ -124,7 +170,16 @@ def pick_symbol():
             if best: return best
     except Exception:
         pass
-    return "BTC"
+    best, best_div = "BTC", -1
+    for s in top20_symbols():
+        data = market_chart(s, days=2)
+        ys = [p[1] for p in data][-60:]
+        if len(ys) < 30: continue
+        e10, e30 = ema(ys, 10)[-1], ema(ys, 30)[-1]
+        div = abs(e10 - e30) / (ys[-1] + 1e-9)
+        if div > best_div:
+            best_div, best = div, s
+    return best
 
 # ========= SIGNALS =========
 def chart_image(sym, entry, tp, sl):
@@ -150,36 +205,33 @@ def build_signal(sym="BTC", equity=1000.0):
     p = price_usd(sym)
     if p is None: return None
     hist = market_chart(sym, days=2)
-    direction = "LONG"
-    if len(hist) >= 30:
-        ys = [v[1] for v in hist]
-        fast, slow = ma(ys, 12), ma(ys, 26)
-        try:
-            direction = "LONG" if fast[-1] >= slow[-1] else "SHORT"
-        except:
-            direction = "LONG"
+    ys = [v[1] for v in hist]
+    direction, conf = infer_direction(ys)
+    lev = leverage_from_conf(conf)
+
     entry = float(p)
     if direction == "LONG":
-        tp, sl = entry*1.025, entry*0.985
+        tp, sl = entry * 1.025, entry * 0.985
     else:
-        tp, sl = entry*0.975, entry*1.015
+        tp, sl = entry * 0.975, entry * 1.015
 
     stop_dist = abs(entry - sl)
-    qty = (equity * RISK_PER_TRADE) / stop_dist
-    notional, cap = qty*entry, equity*DEFAULT_LEVERAGE
+    qty = (equity * RISK_PER_TRADE) / (stop_dist if stop_dist > 0 else (0.001*entry))
+    notional, cap = qty * entry, equity * lev
     if notional > cap:
-        qty *= cap/notional
+        qty *= cap / (notional + 1e-9)
 
     img = chart_image(sym, entry, tp, sl)
     text = (
         f"📊 Сигнал по {sym}\n\n"
-        f"🎯 Вход: {entry:,.2f} $\n"
-        f"💰 Тейк: {tp:,.2f} $\n"
-        f"🛑 Стоп: {sl:,.2f} $\n\n"
-        f"⚖ Плечо: x{DEFAULT_LEVERAGE}\n"
+        f"🎯 Вход: {entry:,.4f} $\n"
+        f"💰 Тейк: {tp:,.4f} $\n"
+        f"🛑 Стоп: {sl:,.4f} $\n\n"
+        f"⚖ Плечо: x{lev}\n"
         f"💵 Риск: {int(RISK_PER_TRADE*100)}% от депозита\n"
-        f"Размер позиции ≈ {qty:,.4f} {sym}\n"
+        f"Размер позиции ≈ {qty:,.6f} {sym}\n"
         f"Направление: {'🟢 LONG' if direction=='LONG' else '🔴 SHORT'}\n"
+        f"Уверенность: {int(conf*100)}%\n"
         f"#signal #{sym.lower()} #crypto"
     )
     return text, img
@@ -195,11 +247,11 @@ def post_signal_once():
         if img: bot.send_photo(TRADING_CHAT, img, caption=text)
         else:   bot.send_message(TRADING_CHAT, text)
         state["signals"] += 1
-        print(f"[signal] posted {sym}")
+        print(f"[signal] {sym} posted")
     except Exception as e:
         bot.send_message(TRADING_CHAT, f"⚠️ Ошибка сигнала: {e}")
 
-# ========= NEWS =========
+# ========= NEWS: RSS + LunarCrush =========
 def parse_rss(url, limit=10):
     out = []
     xml = tget(url)
@@ -241,7 +293,7 @@ def select_news_messages():
         t = (title or "").lower()
         by_symbol = any(f" {s} " in f" {t} " for s in t20)
         influencer = any(k in t for k in INFLUENCER_HINTS)
-        important = any(k in t for k in ["bitcoin","btc","ethereum","eth","binance","coinbase","sec","etf","listing","spot","hack","airdrop","upgrade"])
+        important = any(k in t for k in ["bitcoin","btc","ethereum","eth","binance","coinbase","sec","etf","listing","spot","hack","airdrop","upgrade","trump","musk"])
         if important or by_symbol or influencer:
             msg = f"📰 {title}"
             if link: msg += f"\nПодробнее: {link}"
@@ -272,16 +324,76 @@ def post_news_once():
     except Exception as e:
         bot.send_message(NEWS_CHAT, f"⚠️ Ошибка новостей: {e}")
 
-# ========= SCHEDULER (без внешних библиотек) =========
+# ========= TWITTER / INFLUENCERS =========
+def twitter_enabled():
+    return all([TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET])
+
+influencers = {
+    "elonmusk": "Илон Маск",
+    "realDonaldTrump": "Дональд Трамп",
+    "cz_binance": "CZ (Binance)",
+    "saylor": "Майкл Сэйлор",
+    "VitalikButerin": "Виталик Бутерин"
+}
+
+_last_tweet_id = {}  # username -> last_id (чтобы не постить одно и то же)
+
+def check_influencers():
+    if not twitter_enabled():
+        return []
+    try:
+        import tweepy
+        auth = tweepy.OAuth1UserHandler(
+            TWITTER_API_KEY, TWITTER_API_SECRET,
+            TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
+        )
+        api = tweepy.API(auth, wait_on_rate_limit=True)
+    except Exception as e:
+        print(f"[twitter auth error] {e}")
+        return []
+
+    alerts = []
+    for username, pretty in influencers.items():
+        try:
+            tweets = api.user_timeline(screen_name=username, count=5, tweet_mode="extended", since_id=_last_tweet_id.get(username))
+            max_id = _last_tweet_id.get(username, 0)
+            for t in tweets:
+                text = (t.full_text or "").strip()
+                t_low = text.lower()
+                if any(k in t_low for k in INFLUENCER_HINTS):
+                    url = f"https://twitter.com/{username}/status/{t.id}"
+                    msg = f"💬 {pretty} написал(а):\n{text}\nСсылка: {url}\n#influencer #{username}"
+                    alerts.append(msg)
+                if t.id > max_id:
+                    max_id = t.id
+            if max_id:
+                _last_tweet_id[username] = max_id
+        except Exception as e:
+            print(f"[twitter fetch error] {username}: {e}")
+    return alerts
+
+# ========= SCHEDULER =========
 def scheduler_loop():
-    last_news, last_sig = 0, 0
+    last_news, last_sig, last_tw = 0, 0, 0
     while True:
         now = time.time()
-        if now - last_news >= 30*60:      # новости ~каждые 30 минут (до лимита)
+        # Новости (каждые 30 мин, до лимита)
+        if now - last_news >= 30*60:
             post_news_once(); last_news = now
-        if now - last_sig >= 4*60*60:     # сигналы ~каждые 4 часа (до лимита)
+        # Сигналы (каждые 3 часа, до 2/сутки)
+        if now - last_sig >= 3*60*60:
             post_signal_once(); last_sig = now
-        time.sleep(15)
+        # Инфлюенсеры (каждые 20 мин)
+        if now - last_tw >= 20*60:
+            infl = check_influencers()
+            for m in infl:
+                reset_counters_if_new_day()
+                if state["news"] < MAX_NEWS_PER_DAY:
+                    bot.send_message(NEWS_CHAT, m)
+                    state["news"] += 1
+                    time.sleep(2)
+            last_tw = now
+        time.sleep(12)
 
 # ========= WEBHOOK =========
 WEBHOOK_PATH = f"/{TOKEN}"
@@ -300,7 +412,7 @@ def index():
 # ========= COMMANDS =========
 @bot.message_handler(commands=["start"])
 def start_cmd(m):
-    bot.send_message(m.chat.id, "Привет! Я публикую новости (до 7/день) и сигналы (до 2/день). Всё на русском. Это не финсовет.")
+    bot.send_message(m.chat.id, "Привет! Публикую новости (до 7/день) и сигналы (до 2/день), LONG/SHORT по EMA+RSI. Отслеживаю инфлюенсеров (Маск/Трамп/и др.). Это не финсовет.")
 
 @bot.message_handler(commands=["price"])
 def price_cmd(m):
@@ -315,12 +427,6 @@ def price_cmd(m):
     except Exception as e:
         bot.send_message(m.chat.id, f"Ошибка /price: {e}")
 
-@bot.message_handler(commands=["btc"])
-def btc_cmd(m):
-    p = price_usd("BTC")
-    if p is None: bot.send_message(m.chat.id, "⚠️ Не удалось получить цену BTC"); return
-    bot.send_message(m.chat.id, f"💰 BTC сейчас: ${p:,.2f}")
-
 @bot.message_handler(commands=["signal"])
 def manual_signal(m):
     post_signal_once()
@@ -334,7 +440,8 @@ def manual_news(m):
 @bot.message_handler(commands=["version"])
 def version_cmd(m):
     lunar = "ON" if LUNAR else "OFF"
-    bot.send_message(m.chat.id, f"Version: {VERSION}\nPrices: CoinGecko\nLunarCrush: {lunar}\nWebhooks: ON")
+    tw = "ON" if twitter_enabled() else "OFF"
+    bot.send_message(m.chat.id, f"Version: {VERSION}\nPrices: CoinGecko\nLunarCrush: {lunar}\nTwitter: {tw}\nWebhooks: ON")
 
 # ========= RUN =========
 def run_bg():
