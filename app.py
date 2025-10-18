@@ -450,21 +450,36 @@ def cmd_signal(m):
     post_signals_batch()
     bot.reply_to(m, "✅ Сигналы сгенерированы (если лимит не исчерпан).")
 
-# ============== START ==============
-def delete_webhook_if_any():
-    # Безопасно “гасим” вебхук, чтобы polling не ловил 409
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
-        print("deleteWebhook:", r.text)
-    except Exception as e:
-        print("deleteWebhook error:", e)
+# ============ START ============
 
 def run_scheduler_thread():
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
 
+def delete_webhook_if_any():
+    """Жестко гасим вебхук перед запуском polling, чтобы не ловить 409."""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+        r = requests.get(url, timeout=10)
+        print("deleteWebhook status:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("deleteWebhook error:", e)
+
+def print_webhook_info():
+    """(не обязательно) Просто для логов — посмотреть текущее состояние."""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+        r = requests.get(url, timeout=10)
+        print("getWebhookInfo:", r.status_code, r.text[:200])
+    except Exception as e:
+        print("getWebhookInfo error:", e)
+
 if __name__ == "__main__":
     print("✅ CryptoBot v7.1 Stable starting…")
     delete_webhook_if_any()
+    print_webhook_info()
     run_scheduler_thread()
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+
+    # ВАЖНО: только один способ опроса!
+    # Ниже — единый бесконечный polling.
+    bot.infinity_polling(timeout=60, long_polling_timeout=50, skip_pending=True)
