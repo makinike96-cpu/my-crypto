@@ -396,14 +396,15 @@ def generate_analysis(text):
         return f"⚖️ Новость по {coin} может вызвать краткосрочную волатильность."
     else:
         return f"🤔 {coin}: ситуация неоднозначная, наблюдаем за динамикой."
-            comment = generate_thought(msg)
-            analysis = generate_analysis(msg)
-            bot.send_message(NEWS_CHAT_ID, msg + "\n\n" + comment + "\n" + analysis)
-            add_history(title)      # дедуп
-            inc_quota("news")       # квота
-            time.sleep(3)
-        except Exception as e:
-            print("[tg] news send error:", e)
+    comment = generate_thought(msg)
+    analysis = generate_analysis(msg)
+    bot.send_message(NEWS_CHAT_ID, msg + 
+    "\n\n" + comment + "\n" + analysis)
+    add_history(title)      # дедуп
+    inc_quota("news")       # квота
+    time.sleep(3)
+    except Exception as e:
+        print("[tg] news send error:", e)
 
 # ============ AUTO COMMENT GENERATOR ============
 def generate_thought(text):
