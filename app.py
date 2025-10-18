@@ -144,38 +144,41 @@ def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ============== PRICES (CoinGecko + Binance fallback) ==============
-def cg_price_map(ids):
-    try:
-        url = f"{CG_SIMPLE_PRICE}?ids={','.join(ids)}&vs_currencies=usd"
-        r = requests.get(url, headers=USER_AGENT, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return {k: v["usd"] for k, v in data.items() if isinstance(v, dict) and "usd" in v}
-    except Exception as e:
-        print("[cg] error:", e)
-        return {}
 
-def cg_id_guess(sym_or_id):
-    s = sym_or_id.lower().strip()
-    for cg in TOP_COINS_CG:
-        if s == cg or s == cg.replace("-","") or cg.startswith(s):
-            return cg
-    quick = {
-        "btc":"bitcoin","eth":"ethereum","bnb":"bnb","sol":"solana","xrp":"xrp","ada":"cardano",
-        "doge":"dogecoin","trx":"tron","ton":"toncoin","dot":"polkadot","avax":"avalanche",
-        "link":"chainlink","matic":"matic-network","ltc":"litecoin","uni":"uniswap",
-        "xlm":"stellar","icp":"internet-computer","apt":"aptos","near":"near","etc":"ethereum-classic"
+def get_price(symbol):
+    symbol = symbol.strip().upper()
+    coingecko_map = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "XRP": "ripple",
+        "BNB": "binancecoin",
+        "SOL": "solana",
+        "DOGE": "dogecoin",
+        "ADA": "cardano"
     }
-    return quick.get(s, s)
 
-def binance_price(symbol="BTCUSDT"):
     try:
-        r = requests.get(BINANCE_PRICE, params={"symbol": symbol}, headers=USER_AGENT, timeout=10)
-        r.raise_for_status()
-        return float(r.json()["price"])
+        # CoinGecko
+        name = coingecko_map.get(symbol, symbol.lower())
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={name}&vs_currencies=usd"
+        r = requests.get(url, headers=USER_AGENT, timeout=10)
+        data = r.json()
+        if name in data:
+            return data[name]["usd"]
     except Exception as e:
-        print("[binance] price error:", e)
-        return None
+        print("CoinGecko error:", e)
+
+    try:
+        # Binance fallback
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
+        r = requests.get(url, headers=USER_AGENT, timeout=10)
+        data = r.json()
+        if "price" in data:
+            return float(data["price"])
+    except Exception as e:
+        print("Binance error:", e)
+
+    return None
 
 def cg_price_one(sym_or_id):
     cgid = cg_id_guess(sym_or_id)
@@ -367,12 +370,44 @@ def post_news_batch():
         tr = translate_ru(title)
         msg_html = f"📰 {html_escape(tr)}\n🔗 <a href=\"{html_escape(link)}\">Источник</a>\n#CryptoNews"
         try:
-            bot.send_message(NEWS_CHAT_ID, msg_html, parse_mode="HTML", disable_web_page_preview=False)
+# ============ ADVANCED ANALYSIS ============
+def generate_analysis(text):
+    text_low = text.lower()
+    coin = "рынок"
+    for sym in ["btc", "bitcoin", "eth", "ethereum", "xrp", "solana", "bnb", "layer", "doge"]:
+        if sym in text_low:
+            coin = sym.upper()
+            break
+
+    if any(word in text_low for word in ["rise", "surge", "up", "bullish", "growth", "increase", "gain"]):
+        return f"🚀 Позитивно для {coin} — возможно движение вверх."
+    elif any(word in text_low for word in ["drop", "fall", "bearish", "decline", "down", "risk", "crash"]):
+        return f"📉 Негативно для {coin} — может снизиться в ближайшее время."
+    elif any(word in text_low for word in ["etf", "approval", "law", "decision", "update", "adoption"]):
+        return f"⚖️ Новость по {coin} может вызвать краткосрочную волатильность."
+    else:
+        return f"🤔 {coin}: ситуация неоднозначная, наблюдаем за динамикой."
+           
+            comment = generate_thought(msg)
+            analysis = generate_analysis(msg)
+            bot.send_message(NEWS_CHAT_ID, msg + "\n\n" + comment + "\n" + analysis)
             add_history(title)      # дедуп
             inc_quota("news")       # квота
             time.sleep(3)
         except Exception as e:
             print("[tg] news send error:", e)
+
+# ============ AUTO COMMENT GENERATOR ============
+def generate_thought(text):
+    text = text.lower()
+    if any(word in text for word in ["rise", "surge", "up", "growth", "bullish", "increase", "profit", "gain"]):
+        return "🚀 Новости выглядят позитивно — рынок может показать рост."
+    elif any(word in text for word in ["drop", "fall", "bearish", "decline", "risk", "down", "crash", "recession"]):
+        return "📉 Похоже, аналитики ожидают снижение — стоит быть осторожнее."
+    elif any(word in text for word in ["etf", "approval", "decision", "update", "law", "adoption"]):
+        return "⚖️ Интересное событие — может повлиять на рынок в ближайшие дни."
+    else:
+        return "🤔 Ситуация неясна, наблюдаем за динамикой."
 
 # ============== AUTORUN TASKS ==============
 def post_signals_batch():
@@ -380,7 +415,7 @@ def post_signals_batch():
     if q["signals"] >= MAX_SIGNALS_PER_DAY:
         return
     can = MAX_SIGNALS_PER_DAY - q["signals"]
-    per_run = min(2, can)  # за один прогон максимум 2 поста
+    per_run = min(4, can)  # за один прогон максимум 4 поста
     picked = pick_symbols_for_signals(per_run)
     for cid in picked:
         try:
@@ -398,8 +433,8 @@ def post_signals_batch():
 def scheduler_loop():
     # каждые 3 часа — новости
     schedule.every(3).hours.do(post_news_batch)
-    # каждые 6 часов — сигналы
-    schedule.every(6).hours.do(post_signals_batch)
+    # каждые 4 часов — сигналы
+    schedule.every(4).hours.do(post_signals_batch)
     # мягкий ежедневный ресет квот на всякий случай (файл и так по дате)
     schedule.every().day.at("00:05").do(lambda: save_json(QUOTA_FILE, {"date": today_str(), "news": 0, "signals": 0}))
     # моментальный старт
