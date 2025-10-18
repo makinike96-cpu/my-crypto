@@ -370,7 +370,16 @@ def post_news_batch():
         tr = translate_ru(title)
         msg_html = f"📰 {html_escape(tr)}\n🔗 <a href=\"{html_escape(link)}\">Источник</a>\n#CryptoNews"
         try:
-            # ============ ADVANCED ANALYSIS ============
+           comment = generate_thought(msg)
+           analysis = generate_analysis(msg)
+           bot.send_message(NEWS_CHAT_ID, msg + "\n\n" + comment + "\n\n" + analysis)
+           add_history(title)
+           inc_quota("news")
+           time.sleep(3)
+           except Exception as e:
+           print("[tg news send error]:", e)
+
+     # ============ ADVANCED ANALYSIS ============
 def generate_analysis(text):
     text_low = text.lower()
     coin = "рынок"
