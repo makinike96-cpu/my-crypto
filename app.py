@@ -440,27 +440,28 @@ def post_signals_batch():
 
 # ============== SCHEDULER ==============
 def scheduler_loop():
-    # каждые 3 часа — новости
+    # каждые 3 часа – новости
     schedule.every(3).hours.do(post_news_batch)
-    # каждые 4 часов — сигналы
+    # каждые 4 часа – сигналы
     schedule.every(4).hours.do(post_signals_batch)
-    # мягкий ежедневный ресет квот на всякий случай (файл и так по дате)
-    schedule.every().day.at("00:05").do(lambda: save_json(QUOTA_FILE, {"date": today_str(), "news": 0, "signals": 0}))
+    # мягкий ежедневный ресет квот на всякий случай
+    schedule.every().day.at("00:05").do(lambda: save_json(QUOTA_PATH, {"news": 0, "signals": 0}))
+
     # моментальный старт
     time.sleep(5)
     try:
         post_news_batch()
         post_signals_batch()
     except Exception as e:
-        print("[init run] error:", e)
+        print("[init run error]:", e)
+
     # цикл
     while True:
         try:
             schedule.run_pending()
         except Exception as e:
-            print("[schedule] error:", e)
-        time.sleep(5)
-
+            print("[schedule error]:", e)
+            time.sleep(5)
 # ============== COMMANDS ==============
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
