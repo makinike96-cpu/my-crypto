@@ -6,6 +6,19 @@
 
 import os, io, json, time, math, threading, datetime, urllib.parse
 import requests, schedule, telebot
+
+# --- ФИКС ошибки 409: удаляем webhook перед запуском ---
+try:
+    import requests
+    BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
+    if BOT_TOKEN:
+        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
+        print("✅ Webhook удалён:", r.text)
+    else:
+        print("⚠️ Не найден токен бота, пропускаю удаление webhook.")
+except Exception as e:
+    print("⚠️ Ошибка при удалении webhook:", e)
+
 from xml.etree import ElementTree as ET
 
 # ============== CONFIG ==============
